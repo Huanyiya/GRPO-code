@@ -212,6 +212,27 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
     return prompt
 
 
+def _append_prompt_suffix(prompt, prompt_suffix: str | None):
+    """Append an eval-only instruction without mutating the source dataset row."""
+    if not prompt_suffix:
+        return prompt
+    if isinstance(prompt, str):
+        return prompt + prompt_suffix
+    if not isinstance(prompt, list):
+        raise TypeError(f"Cannot append prompt suffix to prompt of type {type(prompt)}")
+
+    messages = [dict(message) for message in prompt]
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise TypeError("eval_prompt_suffix requires the final user message content to be a string")
+        message["content"] = content + prompt_suffix
+        return messages
+    raise ValueError("eval_prompt_suffix requires at least one user message")
+
+
 class Dataset:
     def __init__(
         self,
@@ -228,12 +249,14 @@ class Dataset:
         seed=42,
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
+        prompt_suffix=None,
     ):
         origin_samples = []
         for data in read_file(path):
             # Both chat templates and multimodal inputs require conversation format (list of message dicts)
             as_conversation = apply_chat_template or (multimodal_keys is not None)
             prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
+            prompt = _append_prompt_suffix(prompt, prompt_suffix)
 
             metadata = data.get(metadata_key) or {}
             tools = None

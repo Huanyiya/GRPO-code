@@ -820,6 +820,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             # The following keys are used to override the rollout version during eval.
             parser.add_argument("--eval-input-key", type=str, default=None, help="JSON dataset key")
             parser.add_argument("--eval-label-key", type=str, default=None, help="JSON dataset key")
+            parser.add_argument(
+                "--eval-prompt-suffix",
+                type=str,
+                default=None,
+                help="Text appended to the final user message of every evaluation prompt.",
+            )
             parser.add_argument("--eval-tool-key", type=str, default=None, help="JSON dataset key")
             parser.add_argument(
                 "--n-samples-per-eval-prompt",
@@ -830,6 +836,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-temperature", type=float, default=None)
             parser.add_argument("--eval-top-p", type=float, default=None)
             parser.add_argument("--eval-top-k", type=int, default=None)
+            parser.add_argument("--eval-presence-penalty", type=float, default=None)
+            parser.add_argument("--eval-repetition-penalty", type=float, default=None)
             parser.add_argument("--eval-max-response-len", type=int, default=None)
             parser.add_argument("--eval-max-prompt-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)

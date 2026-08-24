@@ -28,6 +28,11 @@ def compute_pass_rate(
     rewards_of_group = np.array(flat_rewards).reshape(num_groups, group_size)
 
     log_dict = {}
+    # ``mean@n`` is the mean reward across the n independent responses for
+    # each prompt, followed by the mean over prompts.  For scalar 0/1 math
+    # rewards this is the rollout accuracy at n samples; spelling out n keeps
+    # it aligned with the accompanying pass@n values.
+    log_dict[f"mean@{group_size}"] = np.mean(rewards_of_group.mean(axis=1)).item()
     for k in pass_rate_name_list:
         num_correct = np.sum(rewards_of_group == 1, axis=1)
         num_samples = np.full(num_groups, group_size)

@@ -248,6 +248,12 @@ class ServerGroup:
                     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+                    # The default (20 s) is too short for a first PPU forward
+                    # while kernels are being compiled.  Without this the
+                    # healthy engine's response arrives after its health-check
+                    # request has been cancelled and is logged as a disconnect.
+                    "SGLANG_HEALTH_CHECK_TIMEOUT": "120",
+                    "SGLANG_WARMUP_TIMEOUT": "1800",
                 }.items()
             }
             rollout_engine = RolloutRayActor.options(
@@ -1307,13 +1313,15 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     log_dict = extra_metrics or {}
     for key in data.keys():
         rewards = data[key]["rewards"]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        mean_reward = sum(rewards) / len(rewards)
+        log_dict[f"eval/{key}"] = mean_reward
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
         if args.log_passrate:
+            log_dict[f"eval/{key}-mean@{args.n_samples_per_eval_prompt}"] = mean_reward
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
                     flat_rewards=rewards,

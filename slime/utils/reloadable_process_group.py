@@ -18,6 +18,21 @@ old_new_group_dict = {}
 default_process_group_states = {}
 
 
+def process_group_reloading_enabled() -> bool:
+    """Return whether train sleep/wake may rebuild distributed groups.
+
+    Some CUDA-compatible devices cannot safely use a communicator after all
+    Megatron groups have been destroyed and rebuilt in the same process.  In
+    that case model memory can still be offloaded while idle communicators are
+    kept alive.
+    """
+    value = os.getenv(
+        "SLIME_RELOAD_PROCESS_GROUPS",
+        os.getenv("SLIME_DESTROY_WORLD_PROCESS_GROUP", "1"),
+    )
+    return value.lower() not in {"0", "false", "no"}
+
+
 @dataclass
 class _DefaultProcessGroupState:
     backend: str
@@ -458,6 +473,8 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
 
 def destroy_process_groups():
     """Destroy registered subgroups and replace NCCL WORLD with a temporary Gloo WORLD."""
+    if not process_group_reloading_enabled():
+        return
     state = default_process_group_states.get(os.getpid())
     if state is not None and not state.nccl_world_destroyed and _uses_nccl(state.backend):
         _destroy_default_nccl_process_group()
@@ -467,6 +484,8 @@ def destroy_process_groups():
 
 def reload_process_groups():
     """Restore NCCL WORLD and recreate all registered subgroups."""
+    if not process_group_reloading_enabled():
+        return
     _reload_default_process_group()
     ReloadableProcessGroup.reload_process_groups()
 

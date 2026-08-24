@@ -532,6 +532,7 @@ async def eval_rollout_single_dataset(
             max_length=args.eval_max_prompt_len,
             prompt_key=dataset_cfg.input_key,
             label_key=dataset_cfg.label_key,
+            prompt_suffix=dataset_cfg.prompt_suffix,
             multimodal_keys=eval_multimodal_keys,
             metadata_key=dataset_cfg.metadata_key,
             tool_key=dataset_cfg.tool_key,
@@ -559,6 +560,8 @@ async def eval_rollout_single_dataset(
     )
     if dataset_cfg.repetition_penalty is not None:
         base_sampling_params["repetition_penalty"] = dataset_cfg.repetition_penalty
+    if dataset_cfg.presence_penalty is not None:
+        base_sampling_params["presence_penalty"] = dataset_cfg.presence_penalty
     min_new_tokens = dataset_cfg.min_new_tokens
     if min_new_tokens is None:
         min_new_tokens = getattr(args, "eval_min_new_tokens", None)

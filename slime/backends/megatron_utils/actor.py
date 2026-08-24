@@ -21,11 +21,13 @@ from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import (
     destroy_process_groups,
     monkey_patch_torch_dist,
+    process_group_reloading_enabled,
     register_default_process_group,
     reload_process_groups,
 )
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
+from slime.utils.transformers_compat import register_qwen3_5_configs
 from slime.utils.types import RolloutBatch
 
 from ...utils.profile_utils import TrainProfiler
@@ -55,6 +57,16 @@ logger = logging.getLogger(__name__)
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    def _defer_offload_until_disk_export(self) -> bool:
+        """Keep the trained actor resident until its full disk export finishes."""
+        return (
+            self.role == "actor"
+            and self.args.offload_train
+            and self.args.offload_rollout
+            and self.args.update_weight_mode == "full"
+            and self.args.update_weight_transport == "disk"
+        )
+
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
         self,
@@ -67,14 +79,14 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args = args
             return 0
 
-        monkey_patch_torch_dist()
+        reload_groups = process_group_reloading_enabled()
+        if reload_groups:
+            monkey_patch_torch_dist()
         super().init(args, role, with_ref, with_opd_teacher)
-        # Destroying and recreating WORLD invalidates raw dist.group.WORLD references cached by external code.
-        # Set SLIME_DESTROY_WORLD_PROCESS_GROUP=0 when such references may outlive a train sleep/wake cycle.
-        if os.getenv("SLIME_DESTROY_WORLD_PROCESS_GROUP", "1").lower() not in {"0", "false", "no"}:
+        if reload_groups:
             register_default_process_group(timeout=timedelta(minutes=args.distributed_timeout_minutes))
         else:
-            logger.info("Default WORLD process-group destruction is disabled")
+            logger.info("Process-group destruction/reload is disabled; keeping idle communicators alive")
 
         init(args)
 
@@ -84,6 +96,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof = TrainProfiler(args)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
+        register_qwen3_5_configs()
         for i in range(args.num_gpus_per_node):
             if i == dist.get_rank() % args.num_gpus_per_node:
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
@@ -184,6 +197,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # empty cache after initialization
         clear_memory()
 
+        self._train_residency = "gpu"
+
         if self.args.offload_train:
             # recover to actor in the end.
             self._switch_model("actor")
@@ -204,6 +219,10 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
+        if self._train_residency != "gpu":
+            raise RuntimeError(
+                f"Cannot offload Megatron actor from state={self._train_residency!r}; expected 'gpu'."
+            )
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
@@ -217,15 +236,25 @@ class MegatronTrainRayActor(TrainRayActor):
         destroy_process_groups()
 
         torch_memory_saver.pause()
+        # PPU memory-saver copies are asynchronous.  Finish D2H before SGLang
+        # reuses the same physical device.
+        torch.cuda.synchronize()
+        self._train_residency = "cpu"
 
         print_memory("after offload model")
 
     @timer
     def wake_up(self) -> None:
         assert self.args.offload_train
+        if self._train_residency != "cpu":
+            raise RuntimeError(
+                f"Cannot onload Megatron actor from state={self._train_residency!r}; expected 'cpu'."
+            )
         print_memory("before wake_up model")
 
         torch_memory_saver.resume()
+        # Do not overlap TMS H2D restoration with the first model collective.
+        torch.cuda.synchronize()
 
         clear_memory()
         reload_process_groups()
@@ -238,8 +267,9 @@ class MegatronTrainRayActor(TrainRayActor):
             # after the memory saver is resumed, so later stages cannot miss its
             # lazy initialization.  Sleep still destroys it completely.
             dist.barrier(device_ids=[torch.cuda.current_device()])
-        if self.role == "actor":
+        if self.role == "actor" and self._active_model_tag != "actor":
             self._switch_model("actor")
+        self._train_residency = "gpu"
         print_memory("after wake_up model")
 
     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
@@ -389,7 +419,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train:
             del rollout_data
-            self.sleep()
+            if not self._defer_offload_until_disk_export():
+                self.sleep()
 
         return result
 
@@ -569,8 +600,10 @@ class MegatronTrainRayActor(TrainRayActor):
             return
 
         # torch dist may trigger nccl communication during saving.
-        if self.args.offload_train:
+        woke_for_save = False
+        if self.args.offload_train and self._train_residency == "cpu":
             self.wake_up()
+            woke_for_save = True
 
         if self.args.async_save:
             from megatron.training.async_utils import maybe_finalize_async_save
@@ -585,7 +618,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.save_hf is not None and self.role == "actor":
             save_hf_model_to_path(self.args, Path(self.args.save_hf.format(rollout_id=rollout_id)), self.model)
 
-        if self.args.offload_train:
+        if woke_for_save and not self._defer_offload_until_disk_export():
             self.sleep()
 
     @timer
@@ -607,6 +640,7 @@ class MegatronTrainRayActor(TrainRayActor):
             engine_parallel_configs,
         ) = ray.get(self.rollout_manager.get_updatable_engines_and_lock.remote())
 
+        disk_weight_update = self.args.update_weight_transport == "disk"
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
 
         if not rollout_engines and not reconnect_rollout_engines:
@@ -614,10 +648,19 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info("No updatable SGLang engines are running; skip weight update.")
             return
 
-        if reconnect_rollout_engines:
+        if reconnect_rollout_engines and self._train_residency == "cpu":
             self.wake_up()
-        elif self.args.offload_train:
+        elif self.args.offload_train and not disk_weight_update:
             reload_process_groups()
+
+        # The full HF exporter reads live TP/CP model shards.  Initial weight
+        # synchronization happens while the actor is sleeping, so restore it
+        # here.  Normal post-train exports are already resident because train()
+        # defers its offload until the driver completes this export.
+        woke_for_disk_export = False
+        if disk_weight_update and self.args.offload_train and self._train_residency == "cpu":
+            self.wake_up()
+            woke_for_disk_export = True
 
         if num_new_engines > 0 or reconnect_rollout_engines:
             self.weight_updater.connect_rollout_engines(
@@ -631,7 +674,12 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
-        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+        weight_update_context = (
+            torch_memory_saver.disable()
+            if self.args.offload_train and not disk_weight_update
+            else nullcontext()
+        )
+        with weight_update_context:
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
@@ -647,9 +695,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     self.weights_backuper.backup("old_actor")
 
-        if reconnect_rollout_engines:
+        defer_offload = self._defer_offload_until_disk_export()
+        if woke_for_disk_export and not defer_offload:
             self.sleep()
-        elif self.args.offload_train:
+        elif reconnect_rollout_engines and not defer_offload:
+            self.sleep()
+        elif self.args.offload_train and not defer_offload:
             destroy_process_groups()
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:

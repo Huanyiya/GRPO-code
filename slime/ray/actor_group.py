@@ -161,6 +161,12 @@ class RayTrainGroup:
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
+        if self.uses_split_disk_weight_sync():
+            raise RuntimeError(
+                "Full colocated disk synchronization has two phases. Call "
+                "export_weights_to_disk(), offload the actor, then "
+                "reload_rollout_weights_from_disk()."
+            )
         if not self._full_disk_weight_update_enabled():
             return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
 
@@ -171,6 +177,36 @@ class RayTrainGroup:
         if self._release_train_enabled():
             self.release()
         self._reload_rollout_weights_from_disk(disk_weight_dir, str(weight_version))
+
+    def export_weights_to_disk(self):
+        """Export resident Megatron weights without restoring SGLang."""
+        if not self._full_disk_weight_update_enabled():
+            raise RuntimeError("export_weights_to_disk() requires full disk weight synchronization.")
+
+        weight_version = self._disk_weight_version + 1
+        disk_weight_dir = Path(self.args.update_weight_disk_dir) / f"weight_v{weight_version:06d}"
+        ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+        self._disk_weight_version = weight_version
+        return {
+            "disk_weight_dir": str(disk_weight_dir),
+            "weight_version": str(weight_version),
+        }
+
+    def reload_rollout_weights_from_disk(self, export_result):
+        """Restore only SGLang weights and reload a completed disk export."""
+        if not self._full_disk_weight_update_enabled():
+            raise RuntimeError("reload_rollout_weights_from_disk() requires full disk weight synchronization.")
+
+        disk_weight_dir = Path(export_result["disk_weight_dir"])
+        weight_version = str(export_result["weight_version"])
+        if weight_version != str(self._disk_weight_version):
+            raise RuntimeError(
+                "Refusing to reload a stale disk export: "
+                f"export version={weight_version}, current version={self._disk_weight_version}."
+            )
+        if self.args.offload_rollout:
+            ray.get(self._rollout_manager.onload_weights.remote())
+        self._reload_rollout_weights_from_disk(disk_weight_dir, weight_version)
 
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])
@@ -224,9 +260,22 @@ class RayTrainGroup:
             and self.args.update_weight_transport == "disk"
         )
 
+    def uses_split_disk_weight_sync(self):
+        """Whether actor export and rollout reload need an offload boundary."""
+        return (
+            self._full_disk_weight_update_enabled()
+            and self.args.offload_train
+            and self.args.offload_rollout
+        )
+
     def _reload_rollout_weights_from_disk(self, disk_weight_dir, weight_version):
         assert self._rollout_manager is not None, "disk weight update requires a rollout manager."
-        if self.args.offload_rollout:
+        # In the normal colocated path train.py has already restored the
+        # weights-only region before calling update_weights().  Resuming it a
+        # second time makes SGLang remove "weights" from its offload tag set
+        # twice.  Release-train is the exception: train.py intentionally
+        # skips that early restore because the actor is recreated here.
+        if self.args.offload_rollout and self._release_train_enabled():
             ray.get(self._rollout_manager.onload_weights.remote())
         engines, *_ = ray.get(self._rollout_manager.get_updatable_engines_and_lock.remote())
         if not engines:

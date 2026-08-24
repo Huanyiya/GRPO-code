@@ -2,6 +2,8 @@ from pathlib import Path
 
 from transformers import AutoConfig
 
+from slime.utils.transformers_compat import register_qwen3_5_configs
+
 from .common import load_model_hf_weights
 from .deepseek import deepseek_hf_tensor
 from .glm import glm4_hf_tensor, glm4_moe_hf_tensor
@@ -31,11 +33,13 @@ _LOADERS = {
 
 
 def supports_hf_weight_loading(path: str | Path) -> bool:
+    register_qwen3_5_configs()
     config = AutoConfig.from_pretrained(path, trust_remote_code=True)
     return config.model_type in _LOADERS
 
 
 def load_hf_weights(args, model, path: str | Path) -> None:
+    register_qwen3_5_configs()
     config = AutoConfig.from_pretrained(path, trust_remote_code=True)
     try:
         get_hf_tensor = _LOADERS[config.model_type]

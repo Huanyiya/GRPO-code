@@ -110,3 +110,18 @@ def test_spec_fields_still_fall_back_to_args():
     )
 
     assert datasets[0].temperature == 0.9
+
+
+@pytest.mark.unit
+def test_eval_prompt_suffix_can_be_set_per_dataset():
+    datasets = build_eval_dataset_configs(
+        _args(eval_prompt_suffix="\n\\boxed{...}"),
+        [
+            {"name": "aime", "path": "/d/aime.jsonl"},
+            {"name": "gpqa", "path": "/d/gpqa.jsonl", "prompt_suffix": "\nFinal: \\boxed{...}"},
+        ],
+        defaults={},
+    )
+
+    assert datasets[0].prompt_suffix == "\n\\boxed{...}"
+    assert datasets[1].prompt_suffix == "\nFinal: \\boxed{...}"

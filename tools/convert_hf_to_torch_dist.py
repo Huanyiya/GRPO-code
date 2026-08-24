@@ -1,3 +1,13 @@
+# source scripts/models/qwen3.5-4B.sh
+
+# CUDA_VISIBLE_DEVICES=0 \
+# python -m torch.distributed.run \
+#   --standalone --nproc_per_node=1 \
+#   tools/convert_hf_to_torch_dist.py \
+#   "${MODEL_ARGS[@]}" \
+#   --hf-checkpoint /mnt/cpfs/weights/Qwen3.5-4B \
+#   --save /mnt/cpfs/users/zhy/opd/GRPO/checkpoints/Qwen3.5-4B_torch_dist
+
 import gc
 import os
 import shutil
@@ -15,6 +25,7 @@ from slime.backends.megatron_utils.initialize import init
 from slime.backends.megatron_utils.model_provider import get_model_provider_func
 from slime.utils.logging_utils import configure_logger
 from slime.utils.memory_utils import print_memory
+from slime.utils.transformers_compat import register_qwen3_5_configs
 
 
 def add_convertion_args(parser):
@@ -78,6 +89,8 @@ def get_args():
 
 
 def main():
+    register_qwen3_5_configs()
+
     if torch.version.hip:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
         from slime.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync

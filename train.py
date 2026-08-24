@@ -20,11 +20,16 @@ def train(args):
 
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
-    if args.offload_rollout and not release_train:
-        ray.get(rollout_manager.onload_weights.remote())
-
     # Always push actor weights to rollout once weights are loaded.
-    actor_model.update_weights()
+    split_disk_sync = actor_model.uses_split_disk_weight_sync()
+    if split_disk_sync:
+        initial_export = actor_model.export_weights_to_disk()
+        actor_model.offload()
+        actor_model.reload_rollout_weights_from_disk(initial_export)
+    else:
+        if args.offload_rollout and not release_train:
+            ray.get(rollout_manager.onload_weights.remote())
+        actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
@@ -79,10 +84,16 @@ def train(args):
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
 
-        offload_train(actor_trains)
-        if args.offload_rollout and not release_train:
-            ray.get(rollout_manager.onload_weights.remote())
-        actor_model.update_weights()
+        if actor_trains and split_disk_sync:
+            export_result = actor_model.export_weights_to_disk()
+            actor_model.offload()
+            actor_model.reload_rollout_weights_from_disk(export_result)
+        else:
+            offload_train(actor_trains)
+            if args.offload_rollout and not release_train:
+                ray.get(rollout_manager.onload_weights.remote())
+            if actor_trains:
+                actor_model.update_weights()
 
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())

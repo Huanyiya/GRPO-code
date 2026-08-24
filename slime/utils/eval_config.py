@@ -53,6 +53,16 @@ DATASET_RUNTIME_SPECS: dict[str, dict[str, tuple[str, ...]]] = {
         "default_keys": ("min_new_tokens",),
         "arg_attrs": ("eval_min_new_tokens",),
     },
+    "presence_penalty": {
+        "dataset_keys": ("presence_penalty",),
+        "default_keys": ("presence_penalty",),
+        "arg_attrs": ("eval_presence_penalty",),
+    },
+    "repetition_penalty": {
+        "dataset_keys": ("repetition_penalty",),
+        "default_keys": ("repetition_penalty",),
+        "arg_attrs": ("eval_repetition_penalty",),
+    },
 }
 
 DATASET_SAMPLE_SPECS: dict[str, dict[str, tuple[str, ...]]] = {
@@ -65,6 +75,11 @@ DATASET_SAMPLE_SPECS: dict[str, dict[str, tuple[str, ...]]] = {
         "dataset_keys": ("label_key",),
         "default_keys": ("label_key",),
         "arg_attrs": ("eval_label_key", "label_key"),
+    },
+    "prompt_suffix": {
+        "dataset_keys": ("prompt_suffix",),
+        "default_keys": ("prompt_suffix",),
+        "arg_attrs": ("eval_prompt_suffix",),
     },
     "tool_key": {
         "dataset_keys": ("tool_key",),
@@ -143,6 +158,7 @@ class EvalDatasetConfig:
     # Dataset-specific overrides
     input_key: str | None = None
     label_key: str | None = None
+    prompt_suffix: str | None = None
     tool_key: str | None = None
     metadata_key: str | None = None
     multimodal_keys: dict[str, str] | None = None
@@ -158,6 +174,7 @@ class EvalDatasetConfig:
     stop: list[str] | None = None
     stop_token_ids: list[int] | None = None
     min_new_tokens: int | None = None
+    presence_penalty: float | None = None
     repetition_penalty: float | None = None
     skip_special_tokens: bool | None = None
     no_stop_trim: bool | None = None
@@ -201,6 +218,7 @@ class EvalDatasetConfig:
             self.path,
             self.input_key,
             self.label_key,
+            self.prompt_suffix,
             self.tool_key,
             self.metadata_key,
         )

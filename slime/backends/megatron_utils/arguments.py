@@ -6,6 +6,8 @@ from megatron.training.arguments import validate_args as _megatron_validate_args
 from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
 from transformers import AutoConfig
 
+from slime.utils.transformers_compat import register_qwen3_5_configs
+
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 
 logger = logging.getLogger(__name__)
@@ -91,6 +93,13 @@ def validate_args(args):
 
 
 def _hf_validate_args(args, hf_config):
+    # SGLang currently implements the dense Qwen3.5 text config by inheriting
+    # Qwen3NextConfig. That parent class supplies MoE defaults (512 experts,
+    # etc.) even though dense Qwen3.5 config.json has no MoE fields.
+    # Preserve the outer model type before unwrapping text_config so the
+    # architecture validator can ignore those inherited, non-checkpoint attrs.
+    is_qwen3_5_dense = getattr(hf_config, "model_type", None) == "qwen3_5"
+
     def equal(x, y):
         return x == y
 
@@ -122,6 +131,11 @@ def _hf_validate_args(args, hf_config):
         ("rms_norm_eps", "norm_epsilon", equal),
         ("rms_norm_eps", "layernorm_epsilon", equal),
     ]:
+        if is_qwen3_5_dense and hf_config_name in {
+            "moe_intermediate_size",
+            "shared_expert_intermediate_size",
+        }:
+            continue
         if hf_config_name == "intermediate_size" and not validate_dense_ffn:
             continue
 
@@ -186,6 +200,7 @@ set_default_megatron_args = _set_default_megatron_args
 
 def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
     """Parse megatron args, validate HF config, and set defaults."""
+    register_qwen3_5_configs()
     args = _megatron_parse_args(extra_args_provider=extra_args_provider, ignore_unknown_args=True)
 
     hf_config = None
