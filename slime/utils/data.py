@@ -52,7 +52,11 @@ def read_file(path):
         def parquet_reader(p):
             pf = pq.ParquetFile(p)
 
-            for batch in pf.iter_batches():
+            # PyArrow 24 cannot convert a chunked nested array to Python
+            # objects.  The default 65,536-row batch crosses enough row
+            # groups in datasets with chat-style ``list<struct>`` prompts to
+            # trigger that path; smaller batches remain regular arrays.
+            for batch in pf.iter_batches(batch_size=8192):
                 yield from batch.to_pylist()
 
         reader = parquet_reader(path)

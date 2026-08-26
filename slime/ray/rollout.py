@@ -1,5 +1,6 @@
 import dataclasses
 import itertools
+import json
 import logging
 import multiprocessing
 import os
@@ -724,6 +725,29 @@ class RolloutManager:
                 )
 
             torch.save(dict(rollout_id=rollout_id, **dump_data), path)
+
+        # This deliberately writes only training rollouts.  Evaluation rollouts
+        # can be enabled independently later, but should not be mixed with the
+        # training records requested by --save-rollout-outputs.
+        if not evaluation and (path_template := self.args.save_rollout_outputs) is not None:
+            path = Path(path_template.format(rollout_id=rollout_id))
+            logger.info(f"Save rollout outputs to {path}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as output_file:
+                for sample in data:
+                    reward_trace = sample.metadata.get("code_reward_trace")
+                    record = {
+                        "rollout_id": rollout_id,
+                        "sample_index": sample.index,
+                        "group_index": sample.group_index,
+                        "prompt": sample.prompt,
+                        "generated_code": reward_trace.get("generated_code") if reward_trace else None,
+                        "test_cases": reward_trace.get("test_cases", []) if reward_trace else [],
+                        "final_reward": sample.get_reward_value(self.args),
+                        "failure_reason": reward_trace.get("failure_reason") if reward_trace else None,
+                    }
+                    json.dump(record, output_file, ensure_ascii=False, default=str)
+                    output_file.write("\n")
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         if self.custom_reward_post_process_func is not None:

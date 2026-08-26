@@ -1262,6 +1262,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The file will be saved to `save_debug_rollout_data.format(rollout_id)`."
                 ),
             )
+            parser.add_argument(
+                "--save-rollout-outputs",
+                type=str,
+                default=None,
+                help=(
+                    "Save human-readable rollout outputs as JSONL. "
+                    "The file will be saved to `save_rollout_outputs.format(rollout_id)`."
+                ),
+            )
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(

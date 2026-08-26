@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from slime_plugins.rewards import code_compare, code_sandbox
@@ -23,6 +25,29 @@ _GENERIC_FENCE_RE = re.compile(
     flags=re.DOTALL,
 )
 
+_TOLERANCE_VALUE_RE = (
+    r"(?:\$?\s*10\s*(?:\^|\*\*)?\s*\{?\s*-\s*\d+\s*\}?\s*\$?"
+    r"|\$?\s*\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*\$?)"
+)
+_TOLERANCE_LIMIT_RE = (
+    r"(?:at\s+most|no\s+more\s+than|not\s+more\s+than|"
+    r"less\s+than(?:\s+or\s+equal\s+to)?|"
+    r"(?:does|do|will|should|must)?\s*not\s+exceed|"
+    r"not\s+(?:be\s+)?(?:higher|greater|larger)\s+than|within)"
+)
+_BOTH_TOLERANCES_RE = re.compile(
+    rf"\b(?:absolute\s+(?:or|and)\s+relative|relative\s+(?:or|and)\s+absolute)\s+error\b"
+    rf".{{0,100}}?\b{_TOLERANCE_LIMIT_RE}\s*"
+    rf"(?P<value>{_TOLERANCE_VALUE_RE})",
+    flags=re.IGNORECASE,
+)
+_ONE_TOLERANCE_RE = re.compile(
+    rf"\b(?P<kind>absolute|relative)\s+error\b"
+    rf".{{0,100}}?\b{_TOLERANCE_LIMIT_RE}\s*"
+    rf"(?P<value>{_TOLERANCE_VALUE_RE})",
+    flags=re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CodeTestCase:
@@ -38,6 +63,14 @@ class ParsedTestCases:
 
     test_cases: list[CodeTestCase]
     fn_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FloatTolerance:
+    """Tolerance explicitly stated by a problem statement, if any."""
+
+    abs_tol: Decimal | None = None
+    rel_tol: Decimal | None = None
 
 
 def _last_fenced_code(pattern: re.Pattern[str], response: str) -> str | None:
@@ -72,6 +105,47 @@ def _has_valid_python_syntax(code: str) -> bool:
     except (SyntaxError, ValueError, TypeError, OverflowError):
         return False
     return True
+
+
+def _prompt_to_text(prompt: Any) -> str:
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        return "\n".join(item.get("content", "") for item in prompt if isinstance(item, Mapping))
+    return ""
+
+
+def _parse_tolerance_value(value: str) -> Decimal | None:
+    normalized = value.replace("$", "").replace("−", "-").replace("{", "").replace("}", "").replace("^", "**")
+    normalized = re.sub(r"\s+", "", normalized)
+    power_match = re.fullmatch(r"10(?:\*\*)?-(\d+)", normalized)
+    try:
+        parsed = Decimal(10) ** -int(power_match.group(1)) if power_match else Decimal(normalized)
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
+    return parsed if parsed.is_finite() and parsed >= 0 else None
+
+
+def _extract_float_tolerance(prompt: Any) -> FloatTolerance:
+    """Read only explicitly stated absolute/relative error limits from the prompt."""
+    text = _prompt_to_text(prompt)
+    both_match = _BOTH_TOLERANCES_RE.search(text)
+    if both_match is not None:
+        value = _parse_tolerance_value(both_match.group("value"))
+        if value is not None:
+            return FloatTolerance(abs_tol=value, rel_tol=value)
+
+    absolute_tolerance = None
+    relative_tolerance = None
+    for match in _ONE_TOLERANCE_RE.finditer(text):
+        value = _parse_tolerance_value(match.group("value"))
+        if value is None:
+            continue
+        if match.group("kind").lower() == "absolute":
+            absolute_tolerance = value
+        else:
+            relative_tolerance = value
+    return FloatTolerance(abs_tol=absolute_tolerance, rel_tol=relative_tolerance)
 
 
 def _string_or_lines(value: Any) -> str | None:
@@ -182,42 +256,101 @@ print(_slime_json.dumps(_slime_result, ensure_ascii=False))
 """
 
 
+def _save_outputs_enabled() -> bool:
+    """Whether to attach a serializable reward trace to the sample."""
+    return os.environ.get("SAVE_OUTPUTS", "").strip().lower() == "true"
+
+
+def _finish_reward(sample: Any, trace: dict[str, Any] | None, reward: float, failure_reason: str | None) -> float:
+    """Store optional diagnostics without changing the reward contract."""
+    if trace is not None:
+        trace["final_reward"] = reward
+        trace["failure_reason"] = failure_reason
+        metadata = getattr(sample, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            setattr(sample, "metadata", metadata)
+        metadata["code_reward_trace"] = trace
+    return reward
+
+
+def _sandbox_result_to_dict(result: code_sandbox.ExecutionResult) -> dict[str, Any]:
+    return {
+        "success": result.success,
+        "status": result.status,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "return_code": result.return_code,
+    }
+
+
 async def reward_func(args, sample, **kwargs) -> float:
     """Return one only when every selected standard-I/O testcase passes."""
     del args, kwargs
 
+    trace: dict[str, Any] | None = {"generated_code": None, "test_cases": []} if _save_outputs_enabled() else None
+
     try:
         code = _extract_python_code(getattr(sample, "response", None))
-        if code is None or not _has_valid_python_syntax(code):
-            return 0.0
+        if trace is not None:
+            trace["generated_code"] = code
+        if code is None:
+            return _finish_reward(sample, trace, 0.0, "no_python_code")
+        if not _has_valid_python_syntax(code):
+            return _finish_reward(sample, trace, 0.0, "invalid_python_syntax")
 
         parsed = _parse_test_cases(getattr(sample, "label", None))
         if parsed is None:
-            return 0.0
+            return _finish_reward(sample, trace, 0.0, "invalid_test_cases")
+        float_tolerance = _extract_float_tolerance(getattr(sample, "prompt", None))
 
         for test_case in _select_test_cases(parsed.test_cases):
             if parsed.fn_name is None:
                 executable = code
                 stdin = test_case.input_value
             else:
-                args = _call_args(test_case.input_value)
-                if args is None:
-                    return 0.0
-                executable = _build_call_wrapper(code, parsed.fn_name, args)
+                call_args = _call_args(test_case.input_value)
+                if call_args is None:
+                    return _finish_reward(sample, trace, 0.0, "invalid_call_arguments")
+                executable = _build_call_wrapper(code, parsed.fn_name, call_args)
                 stdin = ""
 
             result = await asyncio.to_thread(code_sandbox.run_code, executable, stdin)
+            testcase_trace: dict[str, Any] | None = None
+            if trace is not None:
+                testcase_trace = {
+                    "original_index": test_case.original_index,
+                    "input": test_case.input_value,
+                    "expected_output": test_case.expected_output,
+                    "sandbox_result": _sandbox_result_to_dict(result),
+                    "output_matches": None,
+                }
+                trace["test_cases"].append(testcase_trace)
             if not result.success or result.status != "ok":
-                return 0.0
+                return _finish_reward(sample, trace, 0.0, f"sandbox_{result.status}")
             if parsed.fn_name is None:
-                output_matches = code_compare.compare_standard_output(result.stdout, test_case.expected_output)
+                output_matches = code_compare.compare_standard_output(
+                    result.stdout,
+                    test_case.expected_output,
+                    abs_tol=float_tolerance.abs_tol,
+                    rel_tol=float_tolerance.rel_tol,
+                )
             else:
-                output_matches = code_compare.compare_call_output(result.stdout, test_case.expected_output)
+                output_matches = code_compare.compare_call_output(
+                    result.stdout,
+                    test_case.expected_output,
+                    abs_tol=float_tolerance.abs_tol,
+                    rel_tol=float_tolerance.rel_tol,
+                )
+            if testcase_trace is not None:
+                testcase_trace["output_matches"] = output_matches
             if not output_matches:
-                return 0.0
-    except Exception:
+                return _finish_reward(sample, trace, 0.0, "output_mismatch")
+    except Exception as exc:
         # Bad data, malformed service responses, and client failures must not
         # escape into the rollout loop.
-        return 0.0
+        if trace is not None:
+            trace["exception"] = f"{type(exc).__name__}: {exc}"
+        return _finish_reward(sample, trace, 0.0, "reward_exception")
 
-    return 1.0
+    return _finish_reward(sample, trace, 1.0, None)

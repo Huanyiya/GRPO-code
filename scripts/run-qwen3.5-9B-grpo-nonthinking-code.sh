@@ -21,19 +21,41 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
 # Paths can be overridden from the environment.
 MODEL_DIR=${MODEL_DIR:-/mnt/cpfs/weights/Qwen3.5-9B}
 INIT_CKPT=${INIT_CKPT:-/mnt/cpfs/users/zhy/opd/GRPO/checkpoints/Qwen3.5-9B_torch_dist}
-SAVE_DIR=${SAVE_DIR:-/mnt/cpfs/users/zhy/opd/GRPO/checkpoints/Qwen3.5-9B-GRPO-nonthinking1}
+SAVE_DIR=${SAVE_DIR:-/mnt/cpfs/users/zhy/opd/GRPO/checkpoints/Qwen3.5-9B-GRPO-code}
+# Set SAVE_OUTPUTS=true to save one human-readable JSONL file per training
+# rollout. Each line records the generated code, every testcase actually run,
+# its SandboxFusion result, and the final binary reward.
+SAVE_OUTPUTS=${SAVE_OUTPUTS:-true}
 
-# Code dataset. `train.parquet` is the merged form of the seven source
-# `train-*-of-00007.parquet` shards, because --prompt-data accepts one file.
-# It has 25,276 code examples with `prompt` and `reward_model` fields.
-CODE_DATA_DIR=${CODE_DATA_DIR:-/mnt/cpfs/users/wxh/GRPO/datasets/dataset/train_data}
-DATA_PATH=${DATA_PATH:-/mnt/cpfs/users/wxh/GRPO/dataset/eurus-2-code-verl/data/train-00000.parquet}
-EVAL_DATA_PATH=${EVAL_DATA_PATH:-${CODE_DATA_DIR}/validation-00000-of-00001.parquet}
+# Select the training data with TRAIN_DATASET=acecode (default) or eurus.
+# DATA_PATH remains available as an explicit one-off override.
+TRAIN_DATASET=${TRAIN_DATASET:-acecode}
+ACECODE_DATA_PATH=${ACECODE_DATA_PATH:-/mnt/cpfs/users/wxh/GRPO/dataset/AceCoder/train/train_rl/OpenRLHF/data/acecode_87K/acecode_87K_hard.slime.jsonl}
+EURUS_DATA_PATH=${EURUS_DATA_PATH:-/mnt/cpfs/users/wxh/GRPO/dataset/eurus-2-code-verl/data/train-00000.parquet}
+
+case "${TRAIN_DATASET}" in
+  acecode)
+    DEFAULT_DATA_PATH="${ACECODE_DATA_PATH}"
+    DEFAULT_REWARD_FUNC="slime_plugins.rewards.acecode.reward_func"
+    ;;
+  eurus)
+    DEFAULT_DATA_PATH="${EURUS_DATA_PATH}"
+    DEFAULT_REWARD_FUNC="slime_plugins.rewards.code.reward_func"
+    ;;
+  *)
+    echo "TRAIN_DATASET must be acecode or eurus; got ${TRAIN_DATASET}." >&2
+    exit 1
+    ;;
+esac
+
+DATA_PATH=${DATA_PATH:-${DEFAULT_DATA_PATH}}
+REWARD_FUNC=${REWARD_FUNC:-${DEFAULT_REWARD_FUNC}}
+EVAL_DATA_PATH=${EVAL_DATA_PATH:-/mnt/cpfs/users/wxh/GRPO/datasets/dataset/Eurus-2-RL-Data/validation-00000-of-00001.parquet}
 TRAIN_INPUT_KEY=${TRAIN_INPUT_KEY:-prompt}
 TRAIN_LABEL_KEY=${TRAIN_LABEL_KEY:-reward_model}
 EVAL_INPUT_KEY=${EVAL_INPUT_KEY:-prompt}
 EVAL_LABEL_KEY=${EVAL_LABEL_KEY:-reward_model}
-echo "Training dataset: code (${DATA_PATH}; input=${TRAIN_INPUT_KEY}; label=${TRAIN_LABEL_KEY})"
+echo "Training dataset: ${TRAIN_DATASET} (${DATA_PATH}; input=${TRAIN_INPUT_KEY}; label=${TRAIN_LABEL_KEY}; reward=${REWARD_FUNC})"
 echo "Validation dataset: code (${EVAL_DATA_PATH}; input=${EVAL_INPUT_KEY}; label=${EVAL_LABEL_KEY})"
 
 # Existing PPU environment and Megatron checkout.
@@ -41,18 +63,22 @@ PYTHON_BIN=${PYTHON_BIN:-/mnt/cpfs/users/zhy/opd/slime-OPD/.venv/bin/python}
 RAY_BIN=${RAY_BIN:-/mnt/cpfs/users/zhy/opd/slime-OPD/.venv/bin/ray}
 MEGATRON_PATH=${MEGATRON_PATH:-/mnt/cpfs/users/zhy/opd/slime-OPD/Megatron-LM}
 
-NUM_GPUS=${NUM_GPUS:-4}
+NUM_GPUS=${NUM_GPUS:-8}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-6379}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
 SOCKET_IFNAME=${SOCKET_IFNAME:-eth0}
-SGLANG_MEM_FRACTION=${SGLANG_MEM_FRACTION:-0.55}
+SGLANG_MEM_FRACTION=${SGLANG_MEM_FRACTION:-0.7}
 # On PPU the first compiled forward can take longer than SGLang's 20 s
 # default health-check request.  A timed-out health check is reported as a
 # client disconnect even when the engine itself is healthy.
 SGLANG_HEALTH_CHECK_TIMEOUT=${SGLANG_HEALTH_CHECK_TIMEOUT:-120}
 SGLANG_WARMUP_TIMEOUT=${SGLANG_WARMUP_TIMEOUT:-1800}
-CACHE_ROOT=${CACHE_ROOT:-${SAVE_DIR}/runtime-cache}
+# Triton/FlashInfer/extension caches contain many short-lived files and must
+# stay off CPFS: its network file handles can become stale while Triton reads
+# a compiled artifact.  Keep this node-local cache across launches to reuse
+# compiled kernels; callers can still override CACHE_ROOT when needed.
+CACHE_ROOT=${CACHE_ROOT:-/dev/shm/wxh-grpo-qwen3.5-9B-runtime-cache}
 # On this PPU, rebuilding PCCL groups and then exporting CUDA IPC tensors can
 # crash inside HGGC.  Use the OPD-proven path by default: export HF weights
 # while Megatron is resident, CPU-offload it, then reload SGLang from disk.
@@ -61,6 +87,9 @@ UPDATE_WEIGHT_DISK_DIR=${UPDATE_WEIGHT_DISK_DIR:-${SAVE_DIR}/weight-sync}
 
 
 WANDB_DIR=${WANDB_DIR:-${SAVE_DIR}/wandb}
+# Leave this empty to use an existing `wandb login` session, or provide the
+# key at launch with WANDB_KEY=... .  Do not commit a personal API key here.
+WANDB_KEY=${WANDB_KEY:-}
 
 # Code rewards are executed by the remote SandboxFusion service.  Do not fall
 # back to executing untrusted model output on this training node.
@@ -69,6 +98,11 @@ CODE_SANDBOX_MAX_CONCURRENT=${CODE_SANDBOX_MAX_CONCURRENT:-64}
 CODE_COMPILE_TIMEOUT=${CODE_COMPILE_TIMEOUT:-10}
 CODE_RUN_TIMEOUT=${CODE_RUN_TIMEOUT:-10}
 CODE_MEMORY_LIMIT_MB=${CODE_MEMORY_LIMIT_MB:-1024}
+
+if [[ "${SAVE_OUTPUTS}" != "true" && "${SAVE_OUTPUTS}" != "false" ]]; then
+  echo "SAVE_OUTPUTS must be exactly true or false; got ${SAVE_OUTPUTS}." >&2
+  exit 1
+fi
 
 if [[ -z "${SANDBOX_FUSION_URL}" ]]; then
   echo "SANDBOX_FUSION_URL must be set to the SandboxFusion execution endpoint." >&2
@@ -88,10 +122,15 @@ if [[ ! -f "${INIT_CKPT}/latest_checkpointed_iteration.txt" ]]; then
   exit 1
 fi
 
-if [[ "${NUM_GPUS}" -ne 4 ]]; then
-  echo "This script is configured for exactly 4 GPUs; got NUM_GPUS=${NUM_GPUS}." >&2
+if [[ "${NUM_GPUS}" -ne 8 ]]; then
+  echo "This script is configured for exactly 8 GPUs; got NUM_GPUS=${NUM_GPUS}." >&2
   exit 1
 fi
+
+# Clear Ray processes left by a previous interrupted training run before any
+# preflight checks or new cluster setup.  `ray stop` only manages Ray-owned
+# processes and does not terminate unrelated Python jobs.
+"${RAY_BIN}" stop --force >/dev/null 2>&1 || true
 
 source "${SCRIPT_DIR}/models/qwen3.5-9B.sh"
 
@@ -100,6 +139,7 @@ export MASTER_ADDR MASTER_PORT
 export SGLANG_HEALTH_CHECK_TIMEOUT SGLANG_WARMUP_TIMEOUT
 export SANDBOX_FUSION_URL
 export CODE_SANDBOX_MAX_CONCURRENT CODE_COMPILE_TIMEOUT CODE_RUN_TIMEOUT CODE_MEMORY_LIMIT_MB
+export SAVE_OUTPUTS
 # HGGC's NVML does not implement nvmlDeviceGetProcessesUtilizationInfo. Ray
 # 2.55's dashboard agent otherwise exits during GPU metric collection, which
 # makes raylet exit and causes `ray start` to time out.
@@ -140,7 +180,7 @@ CKPT_ARGS=(
   --ref-load "${INIT_CKPT}"
   --load "${SAVE_DIR}"
   --save "${SAVE_DIR}"
-  --save-interval 20
+  --save-interval 10
 )
 
 ROLLOUT_ARGS=(
@@ -151,7 +191,7 @@ ROLLOUT_ARGS=(
   --apply-chat-template-kwargs '{"enable_thinking": false}'
   --rollout-shuffle
 
-  --num-rollout 198
+  --num-rollout 187
   --rollout-batch-size 128
   --n-samples-per-prompt 8
   --num-steps-per-rollout 1
@@ -165,9 +205,15 @@ ROLLOUT_ARGS=(
   --balance-data
 )
 
+if [[ "${SAVE_OUTPUTS}" == "true" ]]; then
+  ROLLOUT_ARGS+=(
+    --save-rollout-outputs "${SAVE_DIR}/rollout-outputs/{rollout_id}.jsonl"
+  )
+fi
+
 EVAL_ARGS=(
   # One rollout equals one optimizer step; this evaluates every 50 steps.
-  --eval-interval 50
+  --eval-interval 500
   --skip-eval-before-train
   --eval-prompt-data code_validation "${EVAL_DATA_PATH}"
   --eval-input-key "${EVAL_INPUT_KEY}"
@@ -184,7 +230,7 @@ EVAL_ARGS=(
 )
 
 REWARD_ARGS=(
-  --custom-rm-path slime_plugins.rewards.code.reward_func
+  --custom-rm-path "${REWARD_FUNC}"
 )
 
 GRPO_ARGS=(
@@ -226,18 +272,22 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
   --use-wandb
   --wandb-mode online
-  --wandb-project Qwen3.5-9B-GRPO
+  --wandb-project Qwen3.5-9B-GRPO-code
   --wandb-group code-nonthinking
   --wandb-dir "${WANDB_DIR}"
   --log-passrate
 )
+
+if [[ -n "${WANDB_KEY}" ]]; then
+  WANDB_ARGS+=(--wandb-key "${WANDB_KEY}")
+fi
 
 PERF_ARGS=(
   --tensor-model-parallel-size 2
   --pipeline-model-parallel-size 1
   --context-parallel-size 2
   --sequence-parallel
-  --use-distributed-ptimizer
+  --use-distributed-optimizer
   --expert-model-parallel-size 1
   --expert-tensor-parallel-size 1
 
@@ -297,8 +347,6 @@ if not result.success or result.stdout.strip() != expected_output:
 PY
 echo "SandboxFusion preflight passed."
 
-# Stop only Ray processes managed by Ray; do not kill unrelated Python jobs.
-"${RAY_BIN}" stop --force >/dev/null 2>&1 || true
 "${RAY_BIN}" start \
   --head \
   --node-ip-address "${MASTER_ADDR}" \
@@ -309,11 +357,11 @@ echo "SandboxFusion preflight passed."
   --dashboard-port "${RAY_DASHBOARD_PORT}"
 
 RUNTIME_ENV_JSON=$(printf \
-  '{"env_vars":{"PYTHONPATH":"%s:%s","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"%s","GLOO_SOCKET_IFNAME":"%s","TP_SOCKET_IFNAME":"%s","MASTER_ADDR":"%s","MASTER_PORT":"%s","RAY_DISABLE_DASHBOARD_GPU_METRICS":"1","SLIME_RELOAD_PROCESS_GROUPS":"0","SGLANG_HEALTH_CHECK_TIMEOUT":"%s","SGLANG_WARMUP_TIMEOUT":"%s","no_proxy":"%s","NO_PROXY":"%s","FLASHINFER_WORKSPACE_BASE":"%s","TRITON_CACHE_DIR":"%s","TORCH_EXTENSIONS_DIR":"%s","XDG_CACHE_HOME":"%s","SANDBOX_FUSION_URL":"%s","CODE_SANDBOX_MAX_CONCURRENT":"%s","CODE_COMPILE_TIMEOUT":"%s","CODE_RUN_TIMEOUT":"%s","CODE_MEMORY_LIMIT_MB":"%s"}}' \
+  '{"env_vars":{"PYTHONPATH":"%s:%s","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"%s","GLOO_SOCKET_IFNAME":"%s","TP_SOCKET_IFNAME":"%s","MASTER_ADDR":"%s","MASTER_PORT":"%s","RAY_DISABLE_DASHBOARD_GPU_METRICS":"1","SLIME_RELOAD_PROCESS_GROUPS":"0","SGLANG_HEALTH_CHECK_TIMEOUT":"%s","SGLANG_WARMUP_TIMEOUT":"%s","no_proxy":"%s","NO_PROXY":"%s","FLASHINFER_WORKSPACE_BASE":"%s","TRITON_CACHE_DIR":"%s","TORCH_EXTENSIONS_DIR":"%s","XDG_CACHE_HOME":"%s","SANDBOX_FUSION_URL":"%s","CODE_SANDBOX_MAX_CONCURRENT":"%s","CODE_COMPILE_TIMEOUT":"%s","CODE_RUN_TIMEOUT":"%s","CODE_MEMORY_LIMIT_MB":"%s","SAVE_OUTPUTS":"%s"}}' \
   "${REPO_ROOT}" "${MEGATRON_PATH}" "${HAS_NVLINK}" "${SOCKET_IFNAME}" "${SOCKET_IFNAME}" \
   "${MASTER_ADDR}" "${MASTER_PORT}" "${SGLANG_HEALTH_CHECK_TIMEOUT}" "${SGLANG_WARMUP_TIMEOUT}" "${no_proxy}" "${NO_PROXY}" "${FLASHINFER_WORKSPACE_BASE}" \
   "${TRITON_CACHE_DIR}" "${TORCH_EXTENSIONS_DIR}" "${XDG_CACHE_HOME}" "${SANDBOX_FUSION_URL}" "${CODE_SANDBOX_MAX_CONCURRENT}" \
-  "${CODE_COMPILE_TIMEOUT}" "${CODE_RUN_TIMEOUT}" "${CODE_MEMORY_LIMIT_MB}")
+  "${CODE_COMPILE_TIMEOUT}" "${CODE_RUN_TIMEOUT}" "${CODE_MEMORY_LIMIT_MB}" "${SAVE_OUTPUTS}")
 
 "${RAY_BIN}" job submit \
   --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \

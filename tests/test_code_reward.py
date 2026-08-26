@@ -12,12 +12,15 @@ from slime_plugins.rewards import code
 from slime_plugins.rewards.code_sandbox import ExecutionResult
 
 
-def _sample(response, inputs, outputs, **ground_truth_extra):
+def _sample(response, inputs, outputs, *, prompt=None, **ground_truth_extra):
     ground_truth = {"inputs": inputs, "outputs": outputs, **ground_truth_extra}
-    return SimpleNamespace(
+    sample = SimpleNamespace(
         response=response,
         label={"ground_truth": json.dumps(ground_truth)},
     )
+    if prompt is not None:
+        sample.prompt = prompt
+    return sample
 
 
 def _ok(stdout):
@@ -91,6 +94,40 @@ def test_solution_method_call_returns_one(monkeypatch):
     assert _reward(_sample(generated, [[2, 3]], [5], fn_name="add")) == 1.0
 
 
+def test_eurus_call_based_singleton_wrapped_ground_truth(monkeypatch):
+    monkeypatch.setattr(code.code_sandbox, "run_code", _local_executor)
+
+    string_sample = _sample(
+        """
+def reverse_by_center(s):
+    n = len(s)
+    m = n // 2
+    if n % 2 == 0:
+        return s[m:] + s[:m]
+    return s[m + 1:] + s[m] + s[:m]
+""",
+        [["secret"]],
+        [["retsec"]],
+        fn_name="reverse_by_center",
+    )
+    integer_sample = _sample(
+        "def answer(): return 4321",
+        [[]],
+        [[4321]],
+        fn_name="answer",
+    )
+    list_sample = _sample(
+        "def values(): return [1, 2, 3]",
+        [[]],
+        [[[1, 2, 3]]],
+        fn_name="values",
+    )
+
+    assert _reward(string_sample) == 1.0
+    assert _reward(integer_sample) == 1.0
+    assert _reward(list_sample) == 1.0
+
+
 def test_missing_fn_name_returns_zero(monkeypatch):
     monkeypatch.setattr(code.code_sandbox, "run_code", _local_executor)
     assert _reward(_sample("def other(): return 1", [[]], [1], fn_name="missing")) == 0.0
@@ -103,7 +140,7 @@ def test_missing_fn_name_returns_zero(monkeypatch):
         ("{'a': 1, 'b': 2}", {"a": 1, "b": 2}),
         ("[{'a': [1, 2.0]}, {'ok': True}]", [{"a": [1, 2.0]}, {"ok": True}]),
         ("(1, 2, 3)", [1, 2, 3]),
-        ("0.3000000001", 0.3),
+        ("0.3", 0.3),
     ],
 )
 def test_call_based_structured_outputs(monkeypatch, return_expression, expected):
@@ -115,6 +152,37 @@ def test_call_based_structured_outputs(monkeypatch, return_expression, expected)
 def test_call_based_float_clear_error_fails(monkeypatch):
     monkeypatch.setattr(code.code_sandbox, "run_code", _local_executor)
     assert _reward(_sample("def solve(): return 0.31", [[]], [0.3], fn_name="solve")) == 0.0
+
+
+def test_float_tolerance_requires_an_explicit_problem_statement(monkeypatch):
+    monkeypatch.setattr(code.code_sandbox, "run_code", _local_executor)
+    generated = "def solve(): return 0.3000000001"
+
+    strict_sample = _sample(generated, [[]], [0.3], fn_name="solve")
+    assert _reward(strict_sample) == 0.0
+
+    float_problem_prompt = [
+        {
+            "role": "user",
+            "content": "Print a floating point answer. Absolute or relative error at most 10^{-6} is accepted.",
+        }
+    ]
+    tolerant_sample = _sample(generated, [[]], [0.3], fn_name="solve", prompt=float_problem_prompt)
+    assert _reward(tolerant_sample) == 1.0
+
+
+def test_problem_statement_tolerance_parser_keeps_absolute_and_relative_limits():
+    tolerance = code._extract_float_tolerance(
+        "The answer is correct if absolute error is less than 10^{-6}, or relative error is at most 10^{-9}."
+    )
+    assert tolerance.abs_tol == code.Decimal("1e-6")
+    assert tolerance.rel_tol == code.Decimal("1e-9")
+
+    shared_tolerance = code._extract_float_tolerance(
+        "The relative or absolute error should not be higher than $10^{-7}$."
+    )
+    assert shared_tolerance.abs_tol == code.Decimal("1e-7")
+    assert shared_tolerance.rel_tol == code.Decimal("1e-7")
 
 
 def test_call_based_malformed_json_stdout_fails(monkeypatch):
@@ -166,6 +234,63 @@ def test_fail_fast_stops_after_third_selected_case(monkeypatch):
     inputs = ["x" * length for length in range(1, 21)]
     assert _reward(_sample("print(input())", inputs, inputs)) == 0.0
     assert calls == ["x" * 20, "x" * 19, "x" * 18]
+
+
+def test_save_outputs_records_only_executed_testcases(monkeypatch):
+    monkeypatch.setenv("SAVE_OUTPUTS", "true")
+    calls = []
+
+    def fake_run(generated, stdin):
+        calls.append(stdin)
+        return _ok("wrong") if len(calls) == 2 else _ok(stdin)
+
+    monkeypatch.setattr(code.code_sandbox, "run_code", fake_run)
+    sample = _sample("print(input())", ["first", "second", "third"], ["first", "second", "third"])
+
+    assert _reward(sample) == 0.0
+    trace = sample.metadata["code_reward_trace"]
+    assert trace["generated_code"] == "print(input())"
+    assert trace["final_reward"] == 0.0
+    assert trace["failure_reason"] == "output_mismatch"
+    assert [case["input"] for case in trace["test_cases"]] == ["first", "second"]
+    assert [case["output_matches"] for case in trace["test_cases"]] == [True, False]
+
+
+def test_rollout_outputs_are_human_readable_jsonl(tmp_path):
+    from slime.ray.rollout import RolloutManager
+
+    output_path = tmp_path / "{rollout_id}.jsonl"
+    sample = SimpleNamespace(
+        index=7,
+        group_index=2,
+        prompt="write a program",
+        metadata={
+            "code_reward_trace": {
+                "generated_code": "print(1)",
+                "test_cases": [{"input": "", "sandbox_result": {"status": "ok"}, "output_matches": True}],
+                "failure_reason": None,
+            }
+        },
+        get_reward_value=lambda args: 1.0,
+    )
+    manager = SimpleNamespace(
+        args=SimpleNamespace(save_debug_rollout_data=None, save_rollout_outputs=str(output_path))
+    )
+
+    RolloutManager._save_debug_rollout_data(manager, [sample], rollout_id=3, evaluation=False)
+
+    lines = (tmp_path / "3.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == {
+        "rollout_id": 3,
+        "sample_index": 7,
+        "group_index": 2,
+        "prompt": "write a program",
+        "generated_code": "print(1)",
+        "test_cases": [{"input": "", "sandbox_result": {"status": "ok"}, "output_matches": True}],
+        "final_reward": 1.0,
+        "failure_reason": None,
+    }
 
 
 def _local_executor(generated, stdin):
